@@ -1,0 +1,97 @@
+apiVersion: ray.io/v1
+kind: RayCluster
+metadata:
+  name: inference-pipeline
+  namespace: ray-pipeline
+spec:
+  rayVersion: "2.46.0"
+  enableInTreeAutoscaling: true
+  autoscalerOptions:
+    upscalingMode: Default
+    idleTimeoutSeconds: 120
+    resources:
+      limits:
+        cpu: "500m"
+        memory: "512Mi"
+      requests:
+        cpu: "500m"
+        memory: "512Mi"
+
+  ##################################################################
+  # HEAD NODE — coordination only, no workloads
+  ##################################################################
+  headGroupSpec:
+    rayStartParams:
+      num-cpus: "0"
+      dashboard-host: "0.0.0.0"
+    template:
+      spec:
+        containers:
+          - name: ray-head
+            image: 192.168.110.1:30003/library/ray-pipeline:latest
+            imagePullPolicy: Always
+            ports:
+              - containerPort: 6379
+                name: gcs
+              - containerPort: 8265
+                name: dashboard
+              - containerPort: 10001
+                name: client
+            env:
+              - name: NVIDIA_VISIBLE_DEVICES
+                value: "void"
+            resources:
+              requests:
+                cpu: "2"
+                memory: "4Gi"
+              limits:
+                cpu: "4"
+                memory: "8Gi"
+            volumeMounts:
+              - name: ray-logs
+                mountPath: /tmp/ray
+        volumes:
+          - name: ray-logs
+            emptyDir: {}
+
+  ##################################################################
+  # GPU WORKERS — 1 full physical GPU per pod (MPS quota 100)
+  ##################################################################
+  workerGroupSpecs:
+    - groupName: gpu-workers
+      replicas: 0           # start at 0 — scale on demand
+      minReplicas: 0
+      maxReplicas: 12       # 3 nodes × 4 physical GPUs each
+      rayStartParams:
+        num-cpus: "8"
+        num-gpus: "1"
+      template:
+        metadata:
+          labels:
+            ray-node-type: gpu-worker
+        spec:
+          containers:
+            - name: ray-worker
+              image: 192.168.110.1:30003/library/ray-pipeline:latest
+              imagePullPolicy: Always
+              resources:
+                requests:
+                  cpu: "8"
+                  memory: "16Gi"
+                  nvidia.com/gpu: "100"   # MPS quota 100 = 1 full physical GPU
+                limits:
+                  cpu: "8"
+                  memory: "16Gi"
+                  nvidia.com/gpu: "100"
+              volumeMounts:
+                - name: ray-logs
+                  mountPath: /tmp/ray
+                - name: shm
+                  mountPath: /dev/shm
+          volumes:
+            - name: ray-logs
+              emptyDir: {}
+            - name: shm
+              emptyDir:
+                medium: Memory
+                sizeLimit: 4Gi

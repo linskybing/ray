@@ -1,0 +1,15 @@
+apiVersion: ray.io/v1
+kind: RayJob
+metadata:
+  name: inference-pipeline-job
+  namespace: ray-pipeline
+spec:
+  entrypoint: "python -m src.pipeline --num-workers 6 --total-samples 7680 --cpu-batch-size 32 --gpu-batch-size 256 --io-batch-size 64 --trace-output /tmp/ray/pipeline_trace.json"
+  shutdownAfterJobFinishes: true
+  ttlSecondsAfterFinished: 600
+  clusterSelector:
+    ray.io/cluster: inference-pipeline
+  runtimeEnvYAML: |
+    working_dir: /home/ray/app
+    env_vars:
+      RAY_LOG_TO_STDERR: "1"
