@@ -7,4 +7,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
 
-ENV PYTHONPATH="/home/ray/app:${PYTHONPATH}"
+ENV PYTHONPATH=/home/ray/app

@@ -42,10 +42,11 @@ import numpy as np
 import ray
 import torch
 
-from .model import ModelConfig, load_model
+from .model import INPUT_CHANNELS, INPUT_SIZE, NUM_CLASSES, ModelConfig, load_model
 from .stages import (
     stage1_preprocess,
     stage2_extract_and_infer,
+    stage2_extract_and_infer_timed,
     stage4_postprocess,
 )
 from .trace import TraceRecorder
@@ -63,6 +64,7 @@ NUM_S1_PRODUCERS: Final[int] = 2
 NUM_S4_CONSUMERS: Final[int] = 2
 Q_PRE_EXTRA_SLOTS: Final[int] = 6   # extra buffer beyond minimum
 Q_POST_EXTRA_SLOTS: Final[int] = 4
+DEFAULT_WARMUP_BATCHES: Final[int] = 2
 
 
 @dataclass(frozen=True)
@@ -71,8 +73,9 @@ class PipelineConfig:
 
     cpu_batch_size: int = 32
     gpu_batch_size: int = 256
+    gpu_sub_batch_size: int = 64
     io_batch_size: int = 64
-    total_samples: int = 2560
+    pool_batch_size: int = 64
 
 
 @ray.remote(num_cpus=NUM_CPUS_PER_WORKER, num_gpus=NUM_GPUS_PER_WORKER)
@@ -95,6 +98,7 @@ class PipelineWorker:
         self.model, self.device = load_model(config)
         self.trace = TraceRecorder(worker_id)
         self.batches_processed: int = 0
+        self._gpu_warmed_up = False
 
         # Pre-create CUDA streams for double-buffering
         if self.device.type == "cuda":
@@ -109,15 +113,49 @@ class PipelineWorker:
             "PipelineWorker %d initialized on %s", worker_id, self.device
         )
 
-    def run_pipeline(self, config: PipelineConfig) -> dict:
+    def _record_queue_depth(self, queue_name: str, q: queue.Queue) -> None:
+        self.trace.counter(queue_name, q.qsize(), args={"maxsize": q.maxsize})
+
+    def _warmup_gpu_path(self, warmup_batch_size: int) -> None:
+        if self.device.type != "cuda" or self._gpu_warmed_up:
+            return
+
+        logger.info(
+            "PipelineWorker %d running %d warmup batches at warmup_batch_size=%d",
+            self.worker_id,
+            DEFAULT_WARMUP_BATCHES,
+            warmup_batch_size,
+        )
+        warmup_rng = np.random.default_rng(seed=self.worker_id)
+        warmup_shape = (warmup_batch_size, INPUT_CHANNELS, INPUT_SIZE, INPUT_SIZE)
+        for warmup_stream in self._streams:
+            for _ in range(DEFAULT_WARMUP_BATCHES):
+                warmup_images = warmup_rng.random(warmup_shape, dtype=np.float32)
+                stage2_extract_and_infer(
+                    warmup_images,
+                    self.model.features,
+                    self.model.classifier,
+                    self.device,
+                    stream=warmup_stream,
+                )
+                if warmup_stream is not None:
+                    warmup_stream.synchronize()
+
+        torch.cuda.synchronize(self.device)
+        self._gpu_warmed_up = True
+
+    def run_pipeline(self, config: PipelineConfig, task_pool: ray.actor.ActorHandle) -> dict:
         """Run the multi-thread pipeline with variable per-stage batch sizes.
 
         Returns summary dict with throughput metrics.
         """
-        total_samples = config.total_samples
         cpu_bs = config.cpu_batch_size
         gpu_bs = config.gpu_batch_size
+        gpu_sub_bs = config.gpu_sub_batch_size
         io_bs = config.io_batch_size
+        pool_bs = config.pool_batch_size
+        if gpu_sub_bs <= 0:
+            raise ValueError("gpu_sub_batch_size must be > 0")
 
         # Larger queues absorb bursts from multiple S1 producers
         q_pre: queue.Queue = queue.Queue(
@@ -136,34 +174,48 @@ class PipelineWorker:
         s1_sentinel_lock = threading.Lock()
         num_producers = NUM_S1_PRODUCERS
 
+        self._warmup_gpu_path(gpu_sub_bs)
         start_time = time.monotonic()
         model_features = self.model.features
         model_classifier = self.model.classifier
 
         # ── S1 Producer threads (CPU Preprocess) ─────────────────────
-        def stage1_thread(thread_idx: int, sample_start: int, sample_count: int) -> None:
+        def stage1_thread(thread_idx: int) -> None:
             nonlocal s1_sentinel_count
             rng = np.random.default_rng(seed=self.worker_id * 1000 + thread_idx)
             try:
-                produced = 0
                 batch_idx = 0
-                while produced < sample_count:
-                    bs = min(cpu_bs, sample_count - produced)
-                    with self.trace.record(
-                        "Stage 1: CPU Preprocess", batch_idx,
-                        batch_size=bs,
-                    ):
-                        images = stage1_preprocess(bs, rng=rng)
-                    q_pre.put((images, batch_idx))
-                    produced += bs
-                    batch_idx += 1
+                while True:
+                    granted = ray.get(task_pool.acquire_batch.remote(pool_bs))
+                    if granted == 0:
+                        break
+
+                    remaining = granted
+                    while remaining > 0:
+                        bs = min(cpu_bs, remaining)
+                        with self.trace.record(
+                            "Stage 1: CPU Preprocess", batch_idx,
+                            batch_size=bs,
+                        ):
+                            images = stage1_preprocess(bs, rng=rng)
+                        with self.trace.record(
+                            "Wait: q_pre output",
+                            batch_idx=batch_idx,
+                            batch_size=bs,
+                        ):
+                            q_pre.put((images, batch_idx))
+                        self._record_queue_depth("Queue: q_pre depth", q_pre)
+                        remaining -= bs
+                        batch_idx += 1
             except Exception as exc:
                 error_box.append(exc)
             finally:
                 with s1_sentinel_lock:
                     s1_sentinel_count += 1
                     if s1_sentinel_count >= num_producers:
-                        q_pre.put(_SENTINEL)
+                        with self.trace.record("Wait: q_pre output"):
+                            q_pre.put(_SENTINEL)
+                        self._record_queue_depth("Queue: q_pre depth", q_pre)
 
         # ── GPU Thread (merged Stage 2+3) ────────────────────────────
         def gpu_thread() -> None:
@@ -171,17 +223,20 @@ class PipelineWorker:
                 accumulated: list[np.ndarray] = []
                 accumulated_count = 0
                 gpu_batch_idx = 0
-                stream_idx = 0
 
                 while True:
-                    item = q_pre.get()
+                    with self.trace.record(
+                        "Wait: q_pre input", batch_idx=gpu_batch_idx
+                    ):
+                        item = q_pre.get()
+                    self._record_queue_depth("Queue: q_pre depth", q_pre)
                     if item is _SENTINEL:
                         if accumulated:
                             _run_gpu_stages(
                                 accumulated, gpu_batch_idx,
-                                q_post, io_bs,
+                                q_post, io_bs, gpu_sub_bs,
                                 model_features, model_classifier,
-                                self._streams[stream_idx],
+                                self._streams,
                             )
                         break
 
@@ -192,14 +247,13 @@ class PipelineWorker:
                     if accumulated_count >= gpu_bs:
                         _run_gpu_stages(
                             accumulated, gpu_batch_idx,
-                            q_post, io_bs,
+                            q_post, io_bs, gpu_sub_bs,
                             model_features, model_classifier,
-                            self._streams[stream_idx],
+                            self._streams,
                         )
                         accumulated = []
                         accumulated_count = 0
                         gpu_batch_idx += 1
-                        stream_idx = (stream_idx + 1) % len(self._streams)
             except Exception as exc:
                 error_box.append(exc)
             finally:
@@ -212,7 +266,11 @@ class PipelineWorker:
             try:
                 io_batch_idx = 0
                 while True:
-                    item = q_post.get()
+                    with self.trace.record(
+                        "Wait: q_post input", batch_idx=io_batch_idx
+                    ):
+                        item = q_post.get()
+                    self._record_queue_depth("Queue: q_post depth", q_post)
                     if item is _SENTINEL:
                         break
                     logits_cpu, cpu_features = item
@@ -233,43 +291,100 @@ class PipelineWorker:
             gpu_batch_idx: int,
             out_queue: queue.Queue,
             out_chunk_size: int,
+            sub_batch_size: int,
             features_model: torch.nn.Module,
             classifier_model: torch.nn.Module,
-            stream: torch.cuda.Stream | None,
+            streams: list[torch.cuda.Stream | None],
         ) -> None:
             big_batch = np.concatenate(accumulated, axis=0)
             n = big_batch.shape[0]
+            stream = streams[0] if streams else None
+
+            def _emit_gpu_timing(
+                timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]],
+                reference_ts_us: float,
+                batch_idx: int,
+                batch_size: int,
+            ) -> None:
+                for stage_name, (start_event, end_event) in timing_events.items():
+                    self.trace.record_gpu_timed(
+                        stage_name,
+                        start_event,
+                        end_event,
+                        reference_ts_us=reference_ts_us,
+                        batch_idx=batch_idx,
+                        batch_size=batch_size,
+                    )
+
+            def _enqueue_chunks(
+                logits_cpu: torch.Tensor,
+                cpu_features: np.ndarray,
+                batch_idx: int,
+            ) -> None:
+                chunk_counter = 0
+                for start in range(0, logits_cpu.shape[0], out_chunk_size):
+                    end = min(start + out_chunk_size, logits_cpu.shape[0])
+                    with self.trace.record(
+                        "Wait: q_post output",
+                        batch_idx=batch_idx * 1000 + chunk_counter,
+                        batch_size=end - start,
+                    ):
+                        out_queue.put((logits_cpu[start:end], cpu_features[start:end]))
+                    self._record_queue_depth("Queue: q_post depth", out_queue)
+                    chunk_counter += 1
 
             with self.trace.record(
                 "Stage 2: CPU+GPU Extract", gpu_batch_idx, batch_size=n
             ):
-                logits_cpu, cpu_features = stage2_extract_and_infer(
-                    big_batch, features_model, classifier_model,
-                    self.device, stream=stream,
-                )
+                for sub_idx, start in enumerate(range(0, n, sub_batch_size)):
+                    end = min(start + sub_batch_size, n)
+                    sub_images = big_batch[start:end]
+                    sub_n = end - start
+                    sub_batch_idx = gpu_batch_idx * 10_000 + sub_idx
+                    launched_at_us = self.trace.timestamp_us()
+                    output_buffer = torch.empty(
+                        (sub_n, NUM_CLASSES),
+                        dtype=torch.float32,
+                        device="cpu",
+                        pin_memory=self.device.type == "cuda",
+                    )
+                    del output_buffer
+                    logits_cpu, cpu_features, timing_events = (
+                        stage2_extract_and_infer_timed(
+                            sub_images,
+                            features_model,
+                            classifier_model,
+                            self.device,
+                            stream=stream,
+                            trace_recorder=self.trace,
+                            batch_idx=sub_batch_idx,
+                        )
+                    )
 
-            # Synchronize the stream to ensure logits_cpu is ready
-            if stream is not None:
-                stream.synchronize()
+                    if timing_events:
+                        _emit_gpu_timing(
+                            timing_events,
+                            launched_at_us,
+                            sub_batch_idx,
+                            sub_n,
+                        )
 
-            for start in range(0, n, out_chunk_size):
-                end = min(start + out_chunk_size, n)
-                out_queue.put((logits_cpu[start:end], cpu_features[start:end]))
+                    _enqueue_chunks(
+                        logits_cpu,
+                        cpu_features,
+                        sub_batch_idx,
+                    )
 
         # ── Launch all threads ───────────────────────────────────────
-        # Divide samples evenly across S1 producers
-        samples_per_producer = _split_work(total_samples, num_producers)
         s1_threads = []
-        offset = 0
-        for i, count in enumerate(samples_per_producer):
+        for i in range(num_producers):
             t = threading.Thread(
                 target=stage1_thread,
-                args=(i, offset, count),
+                args=(i,),
                 name=f"s1-cpu-{i}",
                 daemon=True,
             )
             s1_threads.append(t)
-            offset += count
 
         gpu_t = threading.Thread(target=gpu_thread, name="gpu", daemon=True)
 
@@ -312,8 +427,9 @@ class PipelineWorker:
             "config": {
                 "cpu_batch_size": cpu_bs,
                 "gpu_batch_size": gpu_bs,
+                    "gpu_sub_batch_size": gpu_sub_bs,
                 "io_batch_size": io_bs,
-                "total_samples": total_samples,
+                "pool_batch_size": pool_bs,
             },
         }
 
@@ -327,6 +443,7 @@ class PipelineWorker:
             "worker_id": self.worker_id,
             "total_batches_processed": self.batches_processed,
             "device": str(self.device),
+            "gpu_warmed_up": self._gpu_warmed_up,
         }
 
     def health_check(self) -> bool:

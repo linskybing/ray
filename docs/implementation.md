@@ -126,17 +126,19 @@ Problems:
 3. **GIL limitations in asyncio** — CPU-bound and GPU-bound operations in same event loop still block each other
 4. **High GPU idle time** — GPU waits for CPU to finish preprocessing before starting next batch
 
-## 7. Optimized Implementation (3-Thread Variable Batch Pipeline)
+## 7. Optimized Implementation (Global TaskPool + Variable Batch Pipeline)
 
 ### Key Changes
 
-Replace asyncio with **3 native Python threads**, connected via `queue.Queue`:
+Replace asyncio with **native Python threads** plus a **global TaskPool**, connected via `queue.Queue`:
 
-**Thread 1 (S1-CPU)**: Continuously generates preprocessed images in `cpu_batch=32` chunks, placing them in `q_pre`
+**TaskPool Actor**: Centralized global work allocator. All workers pull work in `pool_batch` units, so faster workers naturally consume more tasks.
+
+**Thread 1a/1b (S1-CPU)**: Continuously pulls from TaskPool, preprocesses in `cpu_batch=32` chunks, and places into `q_pre`
 
 **Thread 2 (S23-GPU)**: Accumulates from `q_pre` until reaching `gpu_batch=256`, then runs S2+S3 in GPU. After completion, moves logits back to CPU (`logits.cpu()`), then splits into `io_batch=64` chunks and places in `q_post`
 
-**Thread 3 (S4-Postprocess)**: Retrieves chunks from `q_post`, executes CPU-heavy postprocess
+**Thread 3a/3b (S4-Postprocess)**: Retrieves chunks from `q_post`, executes CPU-heavy postprocess
 
 ### Why Python Threading Works Here
 
@@ -156,7 +158,7 @@ class PipelineConfig:
     cpu_batch_size: int = 32      # S1 small batches to fill queue quickly
     gpu_batch_size: int = 256     # S2+S3 large batches for higher SM utilization
     io_batch_size: int = 64       # S4 medium batches to balance CPU postprocess latency
-    total_samples: int = 2560
+    pool_batch_size: int = 64     # global pull unit from TaskPool
 ```
 
 Design rationale:
@@ -219,11 +221,13 @@ ray/
 │   ├── stages.py      # 4 pure function stages
 │   ├── worker.py      # PipelineWorker Ray Actor (3-thread pipeline)
 │   ├── pipeline.py    # Orchestrator entry point
+│   ├── task_pool.py   # Global work allocator actor
 │   └── trace.py       # Perfetto timeline recorder
 ├── tests/
 │   ├── test_model.py
 │   ├── test_stages.py
 │   ├── test_worker.py
+│   ├── test_task_pool.py
 │   └── test_trace.py
 ├── deploy/
 │   ├── 00-namespace.yaml

@@ -14,10 +14,14 @@ Stage workloads:
 from __future__ import annotations
 
 from typing import Final
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from .trace import TraceRecorder
 
 IMAGE_CHANNELS: Final[int] = 3
 IMAGE_SIZE: Final[int] = 224
@@ -110,6 +114,8 @@ def stage2_extract_and_infer(
     model_classifier: nn.Module,
     device: torch.device,
     stream: torch.cuda.Stream | None = None,
+    trace_recorder: TraceRecorder | None = None,
+    batch_idx: int | None = None,
 ) -> tuple[torch.Tensor, np.ndarray]:
     """Merged Stage 2+3 — GPU feature extraction + classifier in one shot.
 
@@ -130,24 +136,290 @@ def stage2_extract_and_infer(
 
     ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
     with ctx:
-        tensor = tensor.to(device, non_blocking=True)
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2a: H2D Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            tensor = tensor.to(device, non_blocking=True)
         with torch.inference_mode():
-            gpu_features = model_features(tensor)
-            gpu_features = torch.flatten(gpu_features, 1)
-            logits = model_classifier(gpu_features)
-        logits_cpu = logits.cpu()
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 2b: Backbone",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                gpu_features = model_features(tensor)
+                gpu_features = torch.flatten(gpu_features, 1)
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 3: Classifier",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                logits = model_classifier(gpu_features)
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2c: D2H Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            logits_cpu = logits.cpu()
 
     # CPU auxiliary statistics (runs in parallel with GPU work above
     # when non_blocking transfers are used)
-    cpu_features = np.concatenate(
-        [
-            np.mean(images, axis=(2, 3)),
-            np.std(images, axis=(2, 3)),
-        ],
-        axis=1,
-    )
+    with _trace_ctx(
+        trace_recorder,
+        "Stage 2d: CPU Stats",
+        batch_idx=batch_idx,
+        batch_size=images.shape[0],
+    ):
+        cpu_features = np.concatenate(
+            [
+                np.mean(images, axis=(2, 3)),
+                np.std(images, axis=(2, 3)),
+            ],
+            axis=1,
+        )
 
     return logits_cpu, cpu_features
+
+
+def stage2_extract_and_infer_async(
+    images: np.ndarray,
+    model_features: nn.Module,
+    model_classifier: nn.Module,
+    device: torch.device,
+    stream: torch.cuda.Stream | None = None,
+    output_buffer: torch.Tensor | None = None,
+    trace_recorder: TraceRecorder | None = None,
+    batch_idx: int | None = None,
+) -> tuple[
+    torch.Tensor,
+    np.ndarray,
+    torch.cuda.Event | None,
+    dict[str, tuple[torch.cuda.Event, torch.cuda.Event]],
+]:
+    """Async variant of merged Stage 2+3 for stream pipelining.
+
+    On CUDA with a provided stream, this function enqueues H2D, backbone,
+    classifier, and D2H copy (to a CPU pinned buffer) and returns immediately
+    without synchronizing. Caller can wait on the returned completion event.
+    """
+    is_cuda_stream = device.type == "cuda" and stream is not None
+    tensor = torch.from_numpy(images)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+
+    timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+    completion_event: torch.cuda.Event | None = None
+
+    ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
+    with ctx:
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2a: H2D Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            h2d_start, h2d_end = _record_stage_events(stream, is_cuda_stream)
+            tensor = tensor.to(device, non_blocking=True)
+            if is_cuda_stream:
+                tensor.record_stream(stream)
+            _finalize_stage_events(
+                timing_events, "Stage 2a: H2D Transfer", h2d_start, h2d_end, stream
+            )
+
+        with torch.inference_mode():
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 2b: Backbone",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                backbone_start, backbone_end = _record_stage_events(stream, is_cuda_stream)
+                gpu_features = model_features(tensor)
+                gpu_features = torch.flatten(gpu_features, 1)
+                if is_cuda_stream:
+                    gpu_features.record_stream(stream)
+                _finalize_stage_events(
+                    timing_events,
+                    "Stage 2b: Backbone",
+                    backbone_start,
+                    backbone_end,
+                    stream,
+                )
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 3: Classifier",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                classifier_start, classifier_end = _record_stage_events(
+                    stream, is_cuda_stream
+                )
+                logits = model_classifier(gpu_features)
+                if is_cuda_stream:
+                    logits.record_stream(stream)
+                _finalize_stage_events(
+                    timing_events,
+                    "Stage 3: Classifier",
+                    classifier_start,
+                    classifier_end,
+                    stream,
+                )
+
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2c: D2H Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            d2h_start, d2h_end = _record_stage_events(stream, is_cuda_stream)
+            if output_buffer is None:
+                output_buffer = torch.empty(
+                    logits.shape,
+                    dtype=logits.dtype,
+                    device="cpu",
+                    pin_memory=device.type == "cuda",
+                )
+            if device.type == "cuda":
+                output_buffer.copy_(logits, non_blocking=True)
+                if is_cuda_stream:
+                    output_buffer.record_stream(stream)
+            else:
+                output_buffer = logits.cpu()
+            _finalize_stage_events(
+                timing_events, "Stage 2c: D2H Transfer", d2h_start, d2h_end, stream
+            )
+            if is_cuda_stream:
+                completion_event = torch.cuda.Event(enable_timing=True)
+                completion_event.record(stream)
+
+    with _trace_ctx(
+        trace_recorder,
+        "Stage 2d: CPU Stats",
+        batch_idx=batch_idx,
+        batch_size=images.shape[0],
+    ):
+        cpu_features = np.concatenate(
+            [
+                np.mean(images, axis=(2, 3)),
+                np.std(images, axis=(2, 3)),
+            ],
+            axis=1,
+        )
+
+    return output_buffer, cpu_features, completion_event, timing_events
+
+
+def stage2_extract_and_infer_timed(
+    images: np.ndarray,
+    model_features: nn.Module,
+    model_classifier: nn.Module,
+    device: torch.device,
+    stream: torch.cuda.Stream | None = None,
+    trace_recorder: TraceRecorder | None = None,
+    batch_idx: int | None = None,
+) -> tuple[
+    torch.Tensor,
+    np.ndarray,
+    dict[str, tuple[torch.cuda.Event, torch.cuda.Event]],
+]:
+    """Synchronous Stage 2 helper with CUDA event timing.
+
+    This variant records per-stage CUDA events, synchronizes the provided
+    stream before returning, and is intended for conservative sub-batch
+    streaming on real GPUs.
+    """
+    is_cuda_stream = device.type == "cuda" and stream is not None
+    tensor = torch.from_numpy(images)
+    if device.type == "cuda":
+        tensor = tensor.pin_memory()
+
+    timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]] = {}
+
+    ctx = torch.cuda.stream(stream) if stream is not None else _null_ctx()
+    with ctx:
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2a: H2D Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            h2d_start, h2d_end = _record_stage_events(stream, is_cuda_stream)
+            tensor = tensor.to(device, non_blocking=True)
+            _finalize_stage_events(
+                timing_events, "Stage 2a: H2D Transfer", h2d_start, h2d_end, stream
+            )
+
+        with torch.inference_mode():
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 2b: Backbone",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                backbone_start, backbone_end = _record_stage_events(stream, is_cuda_stream)
+                gpu_features = model_features(tensor)
+                gpu_features = torch.flatten(gpu_features, 1)
+                _finalize_stage_events(
+                    timing_events,
+                    "Stage 2b: Backbone",
+                    backbone_start,
+                    backbone_end,
+                    stream,
+                )
+
+            with _trace_ctx(
+                trace_recorder,
+                "Stage 3: Classifier",
+                batch_idx=batch_idx,
+                batch_size=images.shape[0],
+            ):
+                classifier_start, classifier_end = _record_stage_events(
+                    stream, is_cuda_stream
+                )
+                logits = model_classifier(gpu_features)
+                _finalize_stage_events(
+                    timing_events,
+                    "Stage 3: Classifier",
+                    classifier_start,
+                    classifier_end,
+                    stream,
+                )
+
+        with _trace_ctx(
+            trace_recorder,
+            "Stage 2c: D2H Transfer",
+            batch_idx=batch_idx,
+            batch_size=images.shape[0],
+        ):
+            d2h_start, d2h_end = _record_stage_events(stream, is_cuda_stream)
+            logits_cpu = logits.cpu()
+            _finalize_stage_events(
+                timing_events, "Stage 2c: D2H Transfer", d2h_start, d2h_end, stream
+            )
+
+        if stream is not None:
+            stream.synchronize()
+
+    with _trace_ctx(
+        trace_recorder,
+        "Stage 2d: CPU Stats",
+        batch_idx=batch_idx,
+        batch_size=images.shape[0],
+    ):
+        cpu_features = np.concatenate(
+            [
+                np.mean(images, axis=(2, 3)),
+                np.std(images, axis=(2, 3)),
+            ],
+            axis=1,
+        )
+
+    return logits_cpu, cpu_features, timing_events
 
 
 # Keep legacy wrappers so existing tests still pass -----------------------
@@ -262,3 +534,44 @@ from typing import Generator
 def _null_ctx() -> contextmanager:
     """Return a no-op context manager when no CUDA stream is needed."""
     return nullcontext()
+
+
+def _trace_ctx(
+    trace_recorder: TraceRecorder | None,
+    event_name: str,
+    batch_idx: int | None,
+    batch_size: int,
+) -> contextmanager:
+    """Return trace recorder context when tracing is enabled."""
+    if trace_recorder is None:
+        return nullcontext()
+    return trace_recorder.record(
+        event_name,
+        batch_idx=batch_idx,
+        batch_size=batch_size,
+    )
+
+
+def _record_stage_events(
+    stream: torch.cuda.Stream | None,
+    enabled: bool,
+) -> tuple[torch.cuda.Event | None, torch.cuda.Event | None]:
+    if not enabled:
+        return None, None
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record(stream)
+    return start, end
+
+
+def _finalize_stage_events(
+    timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]],
+    stage_name: str,
+    start: torch.cuda.Event | None,
+    end: torch.cuda.Event | None,
+    stream: torch.cuda.Stream | None,
+) -> None:
+    if start is None or end is None:
+        return
+    end.record(stream)
+    timing_events[stage_name] = (start, end)

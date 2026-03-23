@@ -4,7 +4,7 @@ metadata:
   name: inference-pipeline-job
   namespace: ray-pipeline
 spec:
-  entrypoint: "python -m src.pipeline --num-workers 6 --total-samples 7680 --cpu-batch-size 32 --gpu-batch-size 256 --io-batch-size 64 --trace-output /tmp/ray/pipeline_trace.json"
+  entrypoint: "python -m src.pipeline --num-workers 1 --total-samples 2048 --cpu-batch-size 32 --gpu-batch-size 256 --io-batch-size 64 --pool-batch-size 64 --trace-output /tmp/ray/pipeline_trace.json"
   shutdownAfterJobFinishes: true
   ttlSecondsAfterFinished: 600
   clusterSelector:

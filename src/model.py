@@ -32,6 +32,7 @@ class ModelConfig:
     num_classes: int = NUM_CLASSES
     batch_size: int = DEFAULT_BATCH_SIZE
     device: str = "cuda"
+    enable_torch_compile: bool = False
 
 
 class InferenceModel(nn.Module):
@@ -102,8 +103,9 @@ def load_model(
     model = InferenceModel(num_classes=config.num_classes).to(device)
     model.eval()
 
-    # torch.compile reduces kernel launch overhead via CUDA Graphs
-    if device.type == "cuda":
+    # torch.compile can improve steady-state throughput but may add heavy
+    # shape-specialization overhead during startup.
+    if device.type == "cuda" and config.enable_torch_compile:
         try:
             model.features = torch.compile(
                 model.features, mode="reduce-overhead"

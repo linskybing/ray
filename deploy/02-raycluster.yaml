@@ -22,7 +22,7 @@ spec:
   ##################################################################
   headGroupSpec:
     rayStartParams:
-      num-cpus: "0"
+      num-cpus: "1"
       dashboard-host: "0.0.0.0"
     template:
       spec:

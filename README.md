@@ -10,6 +10,7 @@ This project implements a multi-stage GPU inference pipeline using Ray Actor wit
 - Auto-scaling managed by KubeRay autoscaler
 
 ### Pipeline Optimizations
+- Global TaskPool actor for dynamic work-stealing across workers
 - S1: Multi-producer threads (CPU preprocessing)
 - S2 + S3: Merged into single GPU inference path (reduced context switch overhead)
 - Pinned memory + non-blocking transfer
@@ -85,8 +86,9 @@ Local tests completed successfully:
 - tests/test_stages.py
 - tests/test_trace.py
 - tests/test_worker.py
+- tests/test_task_pool.py
 
-Total: 38 tests passed.
+Total: 47 tests passed.
 
 ## 5.1) Local Stage Timing (Post-Update)
 

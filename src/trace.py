@@ -16,6 +16,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Final, Generator
 
+import torch
+
 # Stage name → (category, cname) mapping for Perfetto colors
 STAGE_COLORS: Final[dict[str, tuple[str, str]]] = {
     "Stage 1: CPU Preprocess": ("cpu", "rail_response"),        # Blue
@@ -30,6 +32,32 @@ STAGE_TID: Final[dict[str, int]] = {
     "Stage 2: CPU+GPU Extract": 2,
     "Stage 3: GPU Inference": 3,
     "Stage 4: CPU/IO Postprocess": 4,
+}
+
+TRACE_EVENT_SPECS: Final[dict[str, tuple[str, str, int]]] = {
+    "Stage 1: CPU Preprocess": ("cpu", "rail_response", 1),
+    "Stage 2: CPU+GPU Extract": ("cpu_gpu", "rail_animation", 2),
+    "Stage 3: GPU Inference": ("gpu", "thread_state_running", 3),
+    "Stage 4: CPU/IO Postprocess": ("io", "thread_state_iowait", 4),
+    "Stage 2a: H2D Transfer": ("transfer", "rail_load", 5),
+    "Stage 2b: Backbone": ("gpu", "thread_state_running", 6),
+    "Stage 3: Classifier": ("gpu", "good", 7),
+    "Stage 2c: D2H Transfer": ("transfer", "rail_idle", 8),
+    "Stage 2d: CPU Stats": ("cpu", "background_memory_dump", 9),
+    "Wait: q_pre input": ("wait", "thread_state_runnable", 10),
+    "Wait: q_pre output": ("wait", "cq_build_attempt_failed", 11),
+    "Wait: q_post input": ("wait", "thread_state_runnable", 12),
+    "Wait: q_post output": ("wait", "cq_build_attempt_failed", 13),
+    "Queue: q_pre depth": ("queue", "thread_state_uninterruptible", 14),
+    "Queue: q_post depth": ("queue", "thread_state_uninterruptible", 15),
+    "Stage 2a: H2D Transfer (GPU)": ("gpu_timed", "rail_load", 16),
+    "Stage 2b: Backbone (GPU)": ("gpu_timed", "thread_state_running", 17),
+    "Stage 3: Classifier (GPU)": ("gpu_timed", "good", 18),
+    "Stage 2c: D2H Transfer (GPU)": ("gpu_timed", "rail_idle", 19),
+}
+
+TRACE_THREAD_NAMES: Final[dict[int, str]] = {
+    tid: name for name, (_, _, tid) in TRACE_EVENT_SPECS.items()
 }
 
 
@@ -81,9 +109,17 @@ class TraceRecorder:
         """Microseconds since recorder creation."""
         return (time.perf_counter_ns() - self._base_ns) / 1_000.0
 
+    def timestamp_us(self) -> float:
+        """Public accessor for current trace timeline timestamp (microseconds)."""
+        return self._elapsed_us()
+
     @contextmanager
     def record(
-        self, stage_name: str, batch_idx: int, batch_size: int = 0
+        self,
+        stage_name: str,
+        batch_idx: int | None = None,
+        batch_size: int = 0,
+        args: dict | None = None,
     ) -> Generator[None, None, None]:
         """Context manager that records a complete duration event.
 
@@ -92,15 +128,30 @@ class TraceRecorder:
             with recorder.record("Stage 3: GPU Inference", batch_idx=5, batch_size=256):
                 result = model(tensor)
         """
-        cat, cname = STAGE_COLORS.get(stage_name, ("unknown", "generic_work"))
-        tid = STAGE_TID.get(stage_name, 0)
+        cat, cname, tid = TRACE_EVENT_SPECS.get(
+            stage_name, ("unknown", "generic_work", 0)
+        )
 
         start_us = self._elapsed_us()
         yield
         dur_us = self._elapsed_us() - start_us
 
+        event_args = {"worker_id": self._worker_id}
+        if batch_idx is not None:
+            event_args["batch_idx"] = batch_idx
+        if batch_size:
+            event_args["batch_size"] = batch_size
+        if args:
+            event_args.update(args)
+
+        event_name = (
+            f"{stage_name} [batch {batch_idx}]"
+            if batch_idx is not None
+            else stage_name
+        )
+
         event = TraceEvent(
-            name=f"{stage_name} [batch {batch_idx}]",
+            name=event_name,
             cat=cat,
             ph="X",
             ts=start_us,
@@ -108,11 +159,27 @@ class TraceRecorder:
             pid=self._worker_id,
             tid=tid,
             cname=cname,
-            args={
-                "batch_idx": batch_idx,
-                "worker_id": self._worker_id,
-                "batch_size": batch_size,
-            },
+            args=event_args,
+        )
+        with self._lock:
+            self._events.append(event)
+
+    def counter(self, name: str, value: int | float, args: dict | None = None) -> None:
+        """Record a counter event for queue depth or other sampled metrics."""
+        cat, cname, tid = TRACE_EVENT_SPECS.get(name, ("counter", "generic_work", 0))
+        event_args = {"value": value, "worker_id": self._worker_id}
+        if args:
+            event_args.update(args)
+
+        event = TraceEvent(
+            name=name,
+            cat=cat,
+            ph="C",
+            ts=self._elapsed_us(),
+            pid=self._worker_id,
+            tid=tid,
+            cname=cname,
+            args=event_args,
         )
         with self._lock:
             self._events.append(event)
@@ -120,6 +187,54 @@ class TraceRecorder:
     def get_events(self) -> list[dict]:
         """Return all recorded events as Chrome Trace Format dicts."""
         return [e.to_dict() for e in self._events]
+
+    def record_gpu_timed(
+        self,
+        stage_name: str,
+        start_event: torch.cuda.Event,
+        end_event: torch.cuda.Event,
+        reference_ts_us: float,
+        batch_idx: int | None = None,
+        batch_size: int = 0,
+        args: dict | None = None,
+    ) -> None:
+        """Record a complete event using CUDA event timing.
+
+        ``reference_ts_us`` anchors the event on the host timeline. Duration is
+        derived from CUDA event elapsed time for accurate GPU-side timing.
+        """
+        spec_name = f"{stage_name} (GPU)"
+        cat, cname, tid = TRACE_EVENT_SPECS.get(
+            spec_name, ("gpu_timed", "thread_state_running", 0)
+        )
+        dur_us = start_event.elapsed_time(end_event) * 1_000.0
+
+        event_args = {"worker_id": self._worker_id, "timing_source": "cuda_event"}
+        if batch_idx is not None:
+            event_args["batch_idx"] = batch_idx
+        if batch_size:
+            event_args["batch_size"] = batch_size
+        if args:
+            event_args.update(args)
+
+        event_name = (
+            f"{spec_name} [batch {batch_idx}]"
+            if batch_idx is not None
+            else spec_name
+        )
+        event = TraceEvent(
+            name=event_name,
+            cat=cat,
+            ph="X",
+            ts=reference_ts_us,
+            dur=dur_us,
+            pid=self._worker_id,
+            tid=tid,
+            cname=cname,
+            args=event_args,
+        )
+        with self._lock:
+            self._events.append(event)
 
     @staticmethod
     def _build_metadata_events(worker_ids: list[int]) -> list[dict]:
@@ -135,7 +250,7 @@ class TraceRecorder:
                     "args": {"name": f"Worker {wid}"},
                 }
             )
-            for stage_name, tid in STAGE_TID.items():
+            for tid, stage_name in sorted(TRACE_THREAD_NAMES.items()):
                 metadata.append(
                     {
                         "name": "thread_name",

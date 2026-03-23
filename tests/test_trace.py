@@ -5,7 +5,13 @@ import os
 import tempfile
 import threading
 
-from src.trace import STAGE_COLORS, STAGE_TID, TraceEvent, TraceRecorder
+from src.trace import (
+    STAGE_COLORS,
+    STAGE_TID,
+    TRACE_THREAD_NAMES,
+    TraceEvent,
+    TraceRecorder,
+)
 
 
 class TestTraceEvent:
@@ -55,6 +61,14 @@ class TestTraceRecorder:
         events = recorder.get_events()
         assert events[0]["args"]["batch_size"] == 32
 
+    def test_counter_captures_value(self):
+        recorder = TraceRecorder(worker_id=0)
+        recorder.counter("Queue: q_pre depth", 5, args={"maxsize": 14})
+        events = recorder.get_events()
+        assert events[0]["ph"] == "C"
+        assert events[0]["args"]["value"] == 5
+        assert events[0]["args"]["maxsize"] == 14
+
     def test_multiple_stages_different_colors(self):
         recorder = TraceRecorder(worker_id=1)
         for stage_name in STAGE_COLORS:
@@ -102,8 +116,8 @@ class TestMergeAndSave:
         trace = TraceRecorder.merge([], worker_ids=[0, 1])
         events = trace["traceEvents"]
         metadata = [e for e in events if e["ph"] == "M"]
-        # 2 workers × (1 process_name + 4 thread_names) = 10
-        assert len(metadata) == 10
+        expected = 2 * (1 + len(TRACE_THREAD_NAMES))
+        assert len(metadata) == expected
 
     def test_save_produces_valid_json(self):
         recorder = TraceRecorder(worker_id=0)

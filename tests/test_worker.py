@@ -7,6 +7,7 @@ Runs PipelineWorker in a local Ray cluster with CPU-only mode
 import ray
 import pytest
 
+from src.task_pool import TaskPool
 from src.worker import PipelineConfig, PipelineWorker, _split_work
 
 
@@ -29,11 +30,14 @@ class TestPipelineWorker:
         worker = PipelineWorker.options(num_gpus=0, num_cpus=1).remote(
             worker_id=0,
         )
+        task_pool = TaskPool.remote(total_samples=16)
         config = PipelineConfig(
             cpu_batch_size=4, gpu_batch_size=8, io_batch_size=4,
-            total_samples=16,
+            pool_batch_size=6,
         )
-        result = ray.get(worker.run_pipeline.remote(config=config))
+        result = ray.get(
+            worker.run_pipeline.remote(config=config, task_pool=task_pool)
+        )
         assert result["worker_id"] == 0
         assert result["total_samples"] == 16
         assert result["throughput_samples_per_sec"] > 0
@@ -42,45 +46,61 @@ class TestPipelineWorker:
         worker = PipelineWorker.options(num_gpus=0, num_cpus=1).remote(
             worker_id=1,
         )
+        task_pool = TaskPool.remote(total_samples=8)
         config = PipelineConfig(
             cpu_batch_size=2, gpu_batch_size=4, io_batch_size=2,
-            total_samples=8,
+            pool_batch_size=4,
         )
-        ray.get(worker.run_pipeline.remote(config=config))
+        ray.get(worker.run_pipeline.remote(config=config, task_pool=task_pool))
         events = ray.get(worker.get_trace_events.remote())
-
-        # S1: 8/2=4 micro-batches (split across producers),
-        # S2 (merged S2+S3): 8/4=2 gpu batches,
-        # S4: 8/2=4 io chunks → 4+2+4=10 events
-        assert len(events) == 10
+        names = {e["name"].split(" [batch ")[0] for e in events}
         cats = {e["cat"] for e in events}
-        # No separate "gpu" category anymore — S3 merged into S2
-        assert cats == {"cpu", "cpu_gpu", "io"}
+
+        assert "Stage 1: CPU Preprocess" in names
+        assert "Stage 2: CPU+GPU Extract" in names
+        assert "Stage 2a: H2D Transfer" in names
+        assert "Stage 2b: Backbone" in names
+        assert "Stage 3: Classifier" in names
+        assert "Stage 2c: D2H Transfer" in names
+        assert "Stage 2d: CPU Stats" in names
+        assert "Stage 4: CPU/IO Postprocess" in names
+        assert "Queue: q_pre depth" in names
+        assert "Queue: q_post depth" in names
+        assert "Wait: q_pre input" in names
+        assert "Wait: q_pre output" in names
+        assert "Wait: q_post input" in names
+        assert "Wait: q_post output" in names
+        assert {"cpu", "cpu_gpu", "gpu", "io", "queue", "transfer", "wait"} <= cats
 
     def test_remainder_batch(self):
         """Test non-divisible total_samples is handled correctly."""
         worker = PipelineWorker.options(num_gpus=0, num_cpus=1).remote(
             worker_id=3,
         )
+        task_pool = TaskPool.remote(total_samples=10)
         config = PipelineConfig(
             cpu_batch_size=3, gpu_batch_size=7, io_batch_size=4,
-            total_samples=10,
+            pool_batch_size=6,
         )
-        result = ray.get(worker.run_pipeline.remote(config=config))
+        result = ray.get(
+            worker.run_pipeline.remote(config=config, task_pool=task_pool)
+        )
         assert result["total_samples"] == 10
 
     def test_get_stats(self):
         worker = PipelineWorker.options(num_gpus=0, num_cpus=1).remote(
             worker_id=2,
         )
+        task_pool = TaskPool.remote(total_samples=4)
         config = PipelineConfig(
             cpu_batch_size=2, gpu_batch_size=4, io_batch_size=2,
-            total_samples=4,
+            pool_batch_size=2,
         )
-        ray.get(worker.run_pipeline.remote(config=config))
+        ray.get(worker.run_pipeline.remote(config=config, task_pool=task_pool))
         stats = ray.get(worker.get_stats.remote())
         assert stats["worker_id"] == 2
         assert stats["total_batches_processed"] == 1
+        assert stats["gpu_warmed_up"] is False
 
 
 class TestSplitWork:

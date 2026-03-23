@@ -4,8 +4,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.trace import TraceRecorder
 from src.stages import (
     stage1_preprocess,
+    stage2_extract_and_infer_async,
     stage2_extract_and_infer,
     stage2_feature_extract,
     stage3_inference,
@@ -92,6 +94,83 @@ class TestStage2MergedInference:
         )
         # mean(3 channels) + std(3 channels) = 6
         assert cpu_feat.shape == (4, 6)
+
+    def test_trace_breaks_stage2_into_sub_events(self):
+        images = np.random.randn(4, 3, 224, 224).astype(np.float32)
+        features = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        classifier = nn.Linear(64, 1000)
+        features.eval()
+        classifier.eval()
+        recorder = TraceRecorder(worker_id=0)
+
+        stage2_extract_and_infer(
+            images,
+            features,
+            classifier,
+            torch.device("cpu"),
+            trace_recorder=recorder,
+            batch_idx=0,
+        )
+        names = {event["name"] for event in recorder.get_events()}
+        assert "Stage 2a: H2D Transfer [batch 0]" in names
+        assert "Stage 2b: Backbone [batch 0]" in names
+        assert "Stage 3: Classifier [batch 0]" in names
+        assert "Stage 2c: D2H Transfer [batch 0]" in names
+        assert "Stage 2d: CPU Stats [batch 0]" in names
+
+
+class TestStage2MergedInferenceAsync:
+    """Tests for async stage2_extract_and_infer_async."""
+
+    def test_cpu_fallback_returns_no_cuda_event(self):
+        images = np.random.randn(4, 3, 224, 224).astype(np.float32)
+        features = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        classifier = nn.Linear(64, 1000)
+        features.eval()
+        classifier.eval()
+
+        logits_cpu, cpu_feat, completion_event, timing_events = (
+            stage2_extract_and_infer_async(
+                images,
+                features,
+                classifier,
+                torch.device("cpu"),
+            )
+        )
+
+        assert isinstance(logits_cpu, torch.Tensor)
+        assert isinstance(cpu_feat, np.ndarray)
+        assert logits_cpu.shape == (4, 1000)
+        assert cpu_feat.shape == (4, 6)
+        assert completion_event is None
+        assert timing_events == {}
+
+    def test_cpu_async_matches_sync_outputs(self):
+        images = np.random.randn(4, 3, 224, 224).astype(np.float32)
+        features = nn.Sequential(
+            nn.Conv2d(3, 64, 7, stride=2, padding=3),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        classifier = nn.Linear(64, 1000)
+        features.eval()
+        classifier.eval()
+        device = torch.device("cpu")
+
+        sync_logits, sync_feat = stage2_extract_and_infer(
+            images, features, classifier, device,
+        )
+        async_logits, async_feat, _, _ = stage2_extract_and_infer_async(
+            images, features, classifier, device,
+        )
+
+        assert torch.allclose(sync_logits, async_logits, atol=1e-6)
+        np.testing.assert_allclose(sync_feat, async_feat, atol=1e-6)
 
 
 class TestStage2Legacy:
