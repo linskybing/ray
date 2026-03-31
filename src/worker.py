@@ -61,10 +61,10 @@ _SENTINEL: Final[object] = object()
 
 # Tuning knobs
 NUM_S1_PRODUCERS: Final[int] = 2
-NUM_S4_CONSUMERS: Final[int] = 2
+NUM_S4_CONSUMERS: Final[int] = 3
 Q_PRE_EXTRA_SLOTS: Final[int] = 6   # extra buffer beyond minimum
-Q_POST_EXTRA_SLOTS: Final[int] = 4
-DEFAULT_WARMUP_BATCHES: Final[int] = 2
+Q_POST_EXTRA_SLOTS: Final[int] = 12
+DEFAULT_WARMUP_BATCHES: Final[int] = 4
 
 
 @dataclass(frozen=True)
@@ -179,18 +179,31 @@ class PipelineWorker:
         model_features = self.model.features
         model_classifier = self.model.classifier
 
+        # ── Pre-fill barrier: S1 producers fill q_pre before GPU starts ──
+        prefill_event = threading.Event()
+
         # ── S1 Producer threads (CPU Preprocess) ─────────────────────
+        prefill_signaled = False
+        prefill_signal_lock = threading.Lock()
+        prefill_target = gpu_bs // cpu_bs  # items needed before GPU starts
+
         def stage1_thread(thread_idx: int) -> None:
-            nonlocal s1_sentinel_count
+            nonlocal s1_sentinel_count, prefill_signaled
             rng = np.random.default_rng(seed=self.worker_id * 1000 + thread_idx)
+            bulk_acquire_size = pool_bs * 4
+            local_remaining = 0
             try:
                 batch_idx = 0
                 while True:
-                    granted = ray.get(task_pool.acquire_batch.remote(pool_bs))
-                    if granted == 0:
-                        break
+                    # Bulk acquire from TaskPool to reduce RPC round-trips
+                    if local_remaining <= 0:
+                        granted = ray.get(task_pool.acquire_batch.remote(bulk_acquire_size))
+                        if granted == 0:
+                            break
+                        local_remaining = granted
 
-                    remaining = granted
+                    consume = min(local_remaining, pool_bs)
+                    remaining = consume
                     while remaining > 0:
                         bs = min(cpu_bs, remaining)
                         with self.trace.record(
@@ -207,6 +220,12 @@ class PipelineWorker:
                         self._record_queue_depth("Queue: q_pre depth", q_pre)
                         remaining -= bs
                         batch_idx += 1
+                        # Signal GPU thread once q_pre has enough data
+                        with prefill_signal_lock:
+                            if not prefill_signaled and q_pre.qsize() >= prefill_target:
+                                prefill_signaled = True
+                                prefill_event.set()
+                    local_remaining -= consume
             except Exception as exc:
                 error_box.append(exc)
             finally:
@@ -216,10 +235,15 @@ class PipelineWorker:
                         with self.trace.record("Wait: q_pre output"):
                             q_pre.put(_SENTINEL)
                         self._record_queue_depth("Queue: q_pre depth", q_pre)
+                # Ensure GPU thread is unblocked even if S1 finishes early
+                prefill_event.set()
 
         # ── GPU Thread (merged Stage 2+3) ────────────────────────────
         def gpu_thread() -> None:
             try:
+                # Wait for S1 producers to pre-fill q_pre before starting
+                prefill_event.wait()
+
                 accumulated: list[np.ndarray] = []
                 accumulated_count = 0
                 gpu_batch_idx = 0
@@ -298,7 +322,6 @@ class PipelineWorker:
         ) -> None:
             big_batch = np.concatenate(accumulated, axis=0)
             n = big_batch.shape[0]
-            stream = streams[0] if streams else None
 
             def _emit_gpu_timing(
                 timing_events: dict[str, tuple[torch.cuda.Event, torch.cuda.Event]],
@@ -349,6 +372,8 @@ class PipelineWorker:
                         pin_memory=self.device.type == "cuda",
                     )
                     del output_buffer
+                    # Alternate between streams for H2D/compute overlap
+                    stream = streams[sub_idx % len(streams)] if streams else None
                     logits_cpu, cpu_features, timing_events = (
                         stage2_extract_and_infer_timed(
                             sub_images,
@@ -374,6 +399,12 @@ class PipelineWorker:
                         cpu_features,
                         sub_batch_idx,
                     )
+
+                # Synchronize all used streams after all sub-batches
+                if self.device.type == "cuda":
+                    for s in streams:
+                        if s is not None:
+                            s.synchronize()
 
         # ── Launch all threads ───────────────────────────────────────
         s1_threads = []

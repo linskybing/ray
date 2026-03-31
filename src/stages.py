@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.nn as nn
+from scipy.spatial.distance import cdist
 
 if TYPE_CHECKING:
     from .trace import TraceRecorder
@@ -402,8 +403,8 @@ def stage2_extract_and_infer_timed(
                 timing_events, "Stage 2c: D2H Transfer", d2h_start, d2h_end, stream
             )
 
-        if stream is not None:
-            stream.synchronize()
+        # NOTE: stream.synchronize() is deferred to the caller
+        # (_run_gpu_stages) for better overlap across sub-batches.
 
     with _trace_ctx(
         trace_recorder,
@@ -480,19 +481,17 @@ def stage4_postprocess(
     logits_np = logits.numpy()  # (N, C)
 
     # ── Monte-Carlo uncertainty estimation ──
-    # Generate MC_NUM_SAMPLES perturbed copies, softmax each, average.
-    # Simulates MC-dropout ensemble inference — CPU-heavy loop.
+    # Vectorized: generate all MC_NUM_SAMPLES perturbations at once.
+    # Shape: (MC_NUM_SAMPLES, N, C) — one-shot softmax over all samples.
     mc_rng = np.random.default_rng(seed=42)
-    accumulated = np.zeros_like(logits_np)
-    for _ in range(MC_NUM_SAMPLES):
-        perturbed = logits_np + mc_rng.normal(
-            scale=MC_NOISE_SCALE, size=logits_np.shape
-        ).astype(np.float32)
-        # Numerically-stable softmax in numpy
-        shifted = perturbed - perturbed.max(axis=1, keepdims=True)
-        exp_shifted = np.exp(shifted)
-        accumulated += exp_shifted / exp_shifted.sum(axis=1, keepdims=True)
-    avg_probs = accumulated / MC_NUM_SAMPLES  # (N, C)
+    noise = mc_rng.normal(
+        scale=MC_NOISE_SCALE, size=(MC_NUM_SAMPLES,) + logits_np.shape
+    ).astype(np.float32)
+    perturbed = logits_np[np.newaxis, :, :] + noise  # (S, N, C)
+    shifted = perturbed - perturbed.max(axis=2, keepdims=True)
+    exp_shifted = np.exp(shifted)
+    softmaxed = exp_shifted / exp_shifted.sum(axis=2, keepdims=True)  # (S, N, C)
+    avg_probs = softmaxed.mean(axis=0)  # (N, C)
 
     predictions = np.argmax(avg_probs, axis=1)
     confidences = np.max(avg_probs, axis=1)
@@ -502,11 +501,7 @@ def stage4_postprocess(
     entropy = -np.sum(avg_probs * log_probs, axis=1)  # (N,)
 
     # ── Pairwise L2 distance matrix ──
-    # Uses (a-b)^2 = a^2 - 2ab + b^2 expansion for efficiency.
-    sq_norms = np.sum(avg_probs ** 2, axis=1, keepdims=True)  # (N, 1)
-    dist_sq = sq_norms - 2.0 * (avg_probs @ avg_probs.T) + sq_norms.T  # (N, N)
-    np.maximum(dist_sq, 0.0, out=dist_sq)  # clamp numerical negatives
-    dist_matrix = np.sqrt(dist_sq)  # (N, N)
+    dist_matrix = cdist(avg_probs, avg_probs, metric="euclidean").astype(np.float32)
 
     # ── Top-K nearest-neighbour ranking (simulates NMS / retrieval) ──
     k = min(NMS_TOP_K, dist_matrix.shape[0])
